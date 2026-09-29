@@ -1,0 +1,25 @@
+{
+  "manifest_version": 2,
+  "id": "com.fouc3.dsh-harness",
+  "version": "1.0.0",
+  "name": "DSH Harness 桥接",
+  "description": "通过宿主中转进程驱动本地 DeepSeek Harness：新建会话、续聊、列出会话、检索对话、发送消息。",
+  "author": {
+    "name": "fouc3"
+  },
+  "license": "MIT",
+  "host_application": {
+    "min_version": "1.0.0",
+    "max_version": "1.99.99"
+  },
+  "sdk": {
+    "min_version": "1.0.0",
+    "max_version": "2.99.99"
+  },
+  "capabilities": [
+    "send_message"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN"
+  }
+}
