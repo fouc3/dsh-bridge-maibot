@@ -60,8 +60,16 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_icon__ = "package"
     __ui_order__ = 0
 
-    enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="1.0.0", description="配置版本号")
+    enabled: bool = Field(
+        default=True,
+        description="是否启用插件。关闭后所有工具与命令直接拒绝。",
+        json_schema_extra={"label": "启用插件", "order": 0},
+    )
+    config_version: str = Field(
+        default="1.0.0",
+        description="配置版本号，请勿手动修改。",
+        json_schema_extra={"label": "配置版本", "order": 1},
+    )
 
 
 class DshHarnessConfig(PluginConfigBase):
@@ -71,73 +79,103 @@ class DshHarnessConfig(PluginConfigBase):
 
     plugin: PluginSectionConfig = Field(
         default_factory=PluginSectionConfig,
-        description="插件基础设置",
+        json_schema_extra={"label": "插件基础设置", "order": 0},
     )
+
+    # --- 连接 ---
     bridge_host: str = Field(
         default="172.24.0.1",
         description="宿主机 dsh-bridge 的地址。容器内通常就是 docker 网桥网关。",
+        json_schema_extra={"label": "宿主地址", "order": 10, "group": "连接设置"},
     )
     bridge_port: int = Field(
         default=13081,
         description="宿主机 dsh-bridge 的监听端口。",
+        json_schema_extra={"label": "宿主端口", "order": 11, "group": "连接设置"},
     )
     bridge_token: str = Field(
         default="",
-        description="与 dsh-bridge 约定的共享令牌，必须与宿主 DSH_BRIDGE_TOKEN 一致。",
+        description=(
+            "与 dsh-bridge 约定的共享令牌，必须与宿主 ~/.config/dsh-bridge.env "
+            "里的 DSH_BRIDGE_TOKEN 完全一致。留空时本插件拒绝一切请求。"
+        ),
+        json_schema_extra={"label": "共享令牌", "order": 12, "group": "连接设置"},
     )
     connect_timeout_s: int = Field(
         default=10,
         description="建立 TCP 连接的超时（秒）。",
+        json_schema_extra={"label": "连接超时（秒）", "order": 13, "group": "连接设置"},
     )
     request_timeout_s: int = Field(
         default=900,
-        description="单个请求的总超时（秒），需大于 agent 自身耗时。",
+        description="单个请求的总超时（秒），需大于 agent 自身的耗时。",
+        json_schema_extra={"label": "请求超时（秒）", "order": 14, "group": "连接设置"},
     )
+
+    # --- 行为 ---
     default_cwd: str = Field(
         default="/tmp",
         description="新建会话与默认查找会话时使用的工作目录。",
+        json_schema_extra={"label": "默认工作目录", "order": 20, "group": "任务行为"},
     )
     allowed_senders: list[str] = Field(
-        default=[],
+        default_factory=list,
         description=(
-            "允许触发本插件的发送者 ID 白名单。默认为空 = 任何人都不能触发；"
-            "必须显式填写才生效。"
+            "允许触发本插件的发送者 ID 白名单。"
+            "默认为空 = 任何人都不能触发，必须显式填写才生效。"
         ),
+        json_schema_extra={
+            "label": "允许触发的发送者",
+            "order": 21,
+            "group": "任务行为",
+            "hint": "留空时本插件不会响应任何人。填入 QQ 号，例如 [\"2152595244\"]。",
+        },
     )
     enable_write_ops: bool = Field(
         default=False,
-        description=(
-            "是否允许 agent 执行写操作。为 false 时，提示词会被加上只读约束前缀。"
-        ),
+        description="是否允许 agent 执行写操作。为 false 时，提示词会被加上只读约束前缀。",
+        json_schema_extra={
+            "label": "允许写操作",
+            "order": 22,
+            "group": "任务行为",
+            "hint": "关闭时助手只做只读的调查与分析，不会改动文件。",
+        },
     )
     max_reply_chars: int = Field(
         default=1500,
         description="回传到聊天流的最大字符数，超出则截断。",
+        json_schema_extra={"label": "回复最大字数", "order": 23, "group": "任务行为"},
     )
     search_scan_limit: int = Field(
         default=20,
         description="检索时最多拉取多少个会话的历史来匹配。",
+        json_schema_extra={"label": "检索扫描上限", "order": 24, "group": "任务行为"},
     )
+    report_style: str = Field(
+        default="brief",
+        description="汇报风格：brief = 让麦麦简要总结；detail = 倾向展开细节。",
+        json_schema_extra={"label": "汇报风格", "order": 25, "group": "任务行为"},
+    )
+    followup_enabled: bool = Field(
+        default=True,
+        description="是否允许麦麦在已有结果答不上时，回去追问 DSH 原会话（会重新消耗算力）。",
+        json_schema_extra={"label": "允许回问助手", "order": 26, "group": "任务行为"},
+    )
+
+    # --- 回调 ---
     callback_listen_host: str = Field(
         default="0.0.0.0",
         description=(
-            "接收 dsh-bridge 回调的监听地址。" "默认 0.0.0.0 是为了让容器外的宿主能访问；"
-            "回调需携带正确令牌，令牌不对一律 401。"
+            "接收宿主回调的监听地址。默认 0.0.0.0 是为了让容器外的宿主能访问；"
+            "每个请求都会校验令牌，令牌不对一律 401。"
         ),
+        json_schema_extra={"label": "回调监听地址", "order": 30, "group": "回调与汇报"},
     )
     callback_listen_port: int = Field(
         default=13082,
         description="接收回调的监听端口，需与宿主 DSH_BRIDGE_CALLBACK_URL 一致。",
+        json_schema_extra={"label": "回调监听端口", "order": 31, "group": "回调与汇报"},
     )
-    report_style: str = Field(
-        default="brief",
-        description="汇报风格：brief=让麦麦简要总结；detail=倾向展开细节。",
-    )
-    followup_enabled: bool = Field(
-        default=True,
-        description="是否允许麦麦在已有结果答不上时，回去追问 DSH 原会话。",
-    )
-
 
 
 class CallbackListener:

@@ -44,17 +44,52 @@ def install_sdk_stub() -> None:
         def __call__(self, fn):
             return fn
 
-    class PluginConfigBase:  # noqa: D101 - mirrors the SDK base
+    class _FieldSpec:
+        """What Field() returns: a declared default plus its metadata."""
+
+        def __init__(self, *, default=None, factory=None, extra=None) -> None:
+            self.default = default
+            self.factory = factory
+            self.extra = extra or {}
+
+    class PluginConfigBase:
+        """Minimal stand-in that honours the SDK's Field surface.
+
+        Only the shape a plugin actually depends on is reproduced: declared
+        defaults (including ``default_factory``) and nested config classes
+        materialized as instances.
+        """
+
         def __init__(self, **values) -> None:
-            # Defaults declared as class attributes are the schema defaults,
-            # exactly as the real base materializes them.
-            for name in dir(type(self)):
-                if name.startswith("_"):
-                    continue
-                attr = getattr(type(self), name)
-                if callable(attr):
-                    continue
-                setattr(self, name, values.get(name, attr))
+            for name, spec in self._field_specs().items():
+                if name in values:
+                    setattr(self, name, values[name])
+                elif spec.factory is not None:
+                    setattr(self, name, spec.factory())
+                elif isinstance(spec.default, type) and issubclass(spec.default, PluginConfigBase):
+                    # A nested config class materializes as an instance, which
+                    # is how the real SDK exposes sub-sections.
+                    setattr(self, name, spec.default())
+                else:
+                    setattr(self, name, spec.default)
+
+        @classmethod
+        def _field_specs(cls):
+            """Collect declared fields, subclasses overriding superclasses."""
+            specs = {}
+            for klass in reversed(cls.__mro__):
+                for name, value in vars(klass).items():
+                    if name.startswith("_") or not isinstance(value, _FieldSpec):
+                        continue
+                    specs[name] = value
+            return specs
+
+    def Field(default=None, **kwargs):  # noqa: N802 - mirrors the SDK name
+        return _FieldSpec(
+            default=default,
+            factory=kwargs.get("default_factory"),
+            extra=kwargs.get("json_schema_extra"),
+        )
 
     class MaiBotPlugin:  # noqa: D101 - mirrors the SDK base
         config_model = None
@@ -75,9 +110,6 @@ def install_sdk_stub() -> None:
             if self._plugin_config_instance is None:
                 self._plugin_config_instance = model()
             return self._plugin_config_instance
-
-    def Field(default=None, **kwargs):  # noqa: N802 - mirrors the SDK name
-        return default
 
     sdk.MaiBotPlugin = MaiBotPlugin
     sdk.PluginConfigBase = PluginConfigBase
@@ -295,6 +327,20 @@ def main() -> int:
             # an operator opts senders in.
             check("allowed_senders defaults to empty", list(cfg.allowed_senders) == [])
             check("write ops default to off", cfg.enable_write_ops is False)
+
+            # Every field must carry a Chinese label. The settings page falls
+            # back to the raw field name (e.g. "bridge_host") when none is
+            # given, which reads as an unfinished plugin.
+            specs = DshHarnessConfig._field_specs() if hasattr(DshHarnessConfig, "_field_specs") else {}
+            unlabelled = []
+            for name, spec in specs.items():
+                label = (spec.extra or {}).get("label")
+                if not label:
+                    unlabelled.append(name)
+            # The stub only carries json_schema_extra; the real SDK is checked
+            # separately, so treat an empty field set as "not applicable".
+            if specs:
+                check("every field carries a display label", not unlabelled, f"missing: {unlabelled}")
         except Exception as exc:  # noqa: BLE001
             check("typed config is reachable", False, repr(exc))
 
