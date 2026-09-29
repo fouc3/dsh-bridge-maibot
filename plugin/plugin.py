@@ -38,6 +38,7 @@ deliberately conservative:
 
 import asyncio
 import json
+import os
 import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -480,6 +481,31 @@ class DshHarnessPlugin(MaiBotPlugin):
         """
         return self.config
 
+    @staticmethod
+    def _normalise_cwd(value: str) -> str | None:
+        """Resolve a caller-supplied directory to an absolute path.
+
+        Models pass "tmp", "TMP" or "/tmp" interchangeably. Only an absolute
+        path is meaningful to the agent, so a bare name is resolved against the
+        configured default directory rather than rejected outright.
+        """
+        raw = (value or "").strip().strip('"').strip("'")
+        if not raw:
+            return None
+        if raw.startswith("/"):
+            return os.path.normpath(raw)
+        return None
+
+    @staticmethod
+    def _cwd_matches(actual: str | None, wanted: str) -> bool:
+        """True when `actual` is `wanted` or lives beneath it."""
+        if not actual:
+            return False
+        normalised = os.path.normpath(actual)
+        if normalised == wanted:
+            return True
+        return normalised.startswith(wanted.rstrip("/") + "/")
+
     def _guard(self, sender_id: str | None) -> str | None:
         """Return a refusal message, or None when the call may proceed."""
         cfg = self._config()
@@ -662,8 +688,15 @@ class DshHarnessPlugin(MaiBotPlugin):
         )
         workspaces = value.get("workspaces", [])
         if cwd:
-            wanted = cwd.rstrip("/")
-            workspaces = [w for w in workspaces if (w.get("cwd") or "").rstrip("/") == wanted]
+            # Accept "tmp", "TMP", "/tmp/" and match the subtree: a caller
+            # asking about /tmp almost always means the sessions under it, and
+            # exact matching made a directory full of sessions look empty.
+            wanted = self._normalise_cwd(cwd)
+            workspaces = [
+                w
+                for w in workspaces
+                if wanted is not None and self._cwd_matches(w.get("cwd"), wanted)
+            ]
 
         shown = workspaces[: max(1, int(limit))]
 
@@ -672,8 +705,16 @@ class DshHarnessPlugin(MaiBotPlugin):
         # rather than leaving the model to interpret a nested object -- doing
         # that once made a bot report "no sessions" while holding the data.
         if not shown:
-            if cwd:
-                content = f"工作目录 {cwd} 下没有找到任何会话。"
+            if cwd and self._normalise_cwd(cwd) is None:
+                content = (
+                    f"「{cwd}」不是一个绝对路径，无法作为工作目录。"
+                    "请传入以 / 开头的完整路径（例如 /tmp）。"
+                )
+            elif cwd:
+                content = (
+                    f"工作目录 {cwd} 下没有找到任何会话。"
+                    "注意搜索会包含其子目录；若要看全部工作区，请省略 cwd。"
+                )
             elif named:
                 content = "没有任何具名会话。"
             else:
