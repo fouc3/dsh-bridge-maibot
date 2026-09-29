@@ -641,8 +641,8 @@ class DshHarnessPlugin(MaiBotPlugin):
             "只有带 name 的会话才能被明确继续；要继续某个会话，"
             "把它的 name 填进 dsh_dispatch 的 session_name。\n"
             "\n"
-            "注意：绝大多数历史会话没有名字也没有时间（助手侧不记录），"
-            "这是正常的——它们只能用其所在目录的默认身份继续。\n"
+            "匿名会话（没有 name）依然是一段真实的对话，只是没有名字，"
+            "无法用 session_name 精确指定；要继续它们，就在其所在目录派活即可。\n"
             "\n"
             "- cwd：string，可选。只看这个目录。\n"
             "- named_only：boolean，可选。只列出有名字的会话，默认 false。\n"
@@ -683,7 +683,7 @@ class DshHarnessPlugin(MaiBotPlugin):
             {
                 "cwd": self._config().default_cwd,
                 "namedOnly": named,
-                "maxPerWorkspace": 10,
+                "maxPerWorkspace": 25,
             },
         )
         workspaces = value.get("workspaces", [])
@@ -725,24 +725,42 @@ class DshHarnessPlugin(MaiBotPlugin):
                 total = workspace.get("sessionCount") or 0
                 named_n = workspace.get("namedCount") or 0
                 last = workspace.get("lastUsedAt")
-                header = f"{workspace.get('cwd')}（{total} 个会话"
+                header = f"{workspace.get('cwd')}（共 {total} 个会话"
                 if named_n:
-                    header += f"，其中 {named_n} 个有名字"
+                    header += f"，其中 {named_n} 个具名"
                 header += "）" if last is None else f"，最近使用 {last}）"
                 lines.append(header)
-                names = [
-                    s.get("name")
-                    for s in workspace.get("sessions", [])
-                    if s.get("name")
-                ]
-                if names:
-                    lines.append("    可接着聊的会话名：" + "、".join(names))
-                else:
-                    lines.append("    （该目录下的会话都没有名字，可用其目录默认身份继续）")
+                # List every session with an identifiable handle. Reporting
+                # anonymous sessions as a single "all unnamed" line hid dozens
+                # of real conversations behind one sentence, and a bot reading
+                # it concluded the directory held nothing but leftovers.
+                entries = workspace.get("sessions", [])
+                for entry in entries:
+                    label = entry.get("name")
+                    title = entry.get("title")
+                    # Prefer the conversation's own title: an id tells a reader
+                    # nothing about what the session was for.
+                    if title:
+                        shown_name = title
+                    elif label:
+                        shown_name = f"{label}（具名会话）"
+                    else:
+                        shown_name = "未命名会话"
+                    when = entry.get("lastUsedAt")
+                    bits = []
+                    if entry.get("closed"):
+                        bits.append("已关闭")
+                    if when:
+                        bits.append(f"最近 {when}")
+                    suffix = f"（{'，'.join(bits)}）" if bits else ""
+                    lines.append(f"    - {shown_name}{suffix}")
+                hidden = total - len(entries)
+                if hidden > 0:
+                    lines.append(f"    …另有 {hidden} 个较旧的会话未列出")
             content = (
                 f"共 {len(workspaces)} 个工作区，"
-                f"{value.get('totalSessions')} 个会话（其中 "
-                f"{value.get('namedSessions')} 个有名字）：\n"
+                f"{value.get('totalSessions')} 个会话"
+                f"（{value.get('namedSessions')} 个具名，其余为未命名会话）：\n"
                 + "\n".join(lines)
             )
 
