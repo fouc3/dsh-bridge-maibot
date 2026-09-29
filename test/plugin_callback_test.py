@@ -178,6 +178,48 @@ def post(url: str, payload, token: str | None = TOKEN, raw: bytes | None = None)
             return exc.code, text
 
 
+def check_tool_outputs() -> None:
+    """Every tool must hand the model readable text in `content`.
+
+    The bot only reads `content`; structured fields are for callers that parse
+    the result. A tool that returns data without `content` leaves the model
+    looking at nothing, which is how a bot once answered "no sessions" while
+    the session list sat unread in the same dict.
+    """
+    import asyncio
+    import inspect
+
+    from plugin import DshHarnessPlugin
+
+    # Only Tool handlers feed the model; Command handlers return
+    # (ok, text, weight) and send their own reply, so they carry no content.
+    tool_names = set()
+    for name, value in vars(DshHarnessPlugin).items():
+        spec = getattr(value, "__dict__", {})
+        if spec.get("_maibot_component") == "tool" or getattr(value, "_is_tool", False):
+            tool_names.add(name)
+    if not tool_names:
+        # The stub's decorators are no-ops, so fall back to the known surface.
+        tool_names = {
+            n
+            for n, v in vars(DshHarnessPlugin).items()
+            if n.startswith("handle_") and asyncio.iscoroutinefunction(v) and n != "handle_command"
+        }
+    handlers = sorted(tool_names)
+    check("tool handlers were found", len(handlers) >= 5, f"found {handlers}")
+
+    missing = [
+        name
+        for name in handlers
+        if '"content"' not in inspect.getsource(getattr(DshHarnessPlugin, name))
+    ]
+    check(
+        "every tool returns a content field",
+        not missing,
+        f"these never populate content: {missing}",
+    )
+
+
 def main() -> int:
     received: list[dict] = []
     lock = threading.Lock()
@@ -344,6 +386,11 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001
             check("typed config is reachable", False, repr(exc))
 
+    # 11. Every tool must hand the model readable text in `content`; the bot
+    #     reads nothing else. Returning data without it is how a bot ended up
+    #     reporting "no sessions" while holding the session list.
+    check_tool_outputs()
+
     print()
     if failures:
         print(f"{len(failures)} 项失败: {', '.join(failures)}")
@@ -354,3 +401,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

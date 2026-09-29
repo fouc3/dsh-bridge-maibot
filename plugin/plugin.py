@@ -662,29 +662,64 @@ class DshHarnessPlugin(MaiBotPlugin):
         )
         workspaces = value.get("workspaces", [])
         if cwd:
-            workspaces = [w for w in workspaces if w.get("cwd") == cwd]
+            wanted = cwd.rstrip("/")
+            workspaces = [w for w in workspaces if (w.get("cwd") or "").rstrip("/") == wanted]
 
-        trimmed = []
-        for workspace in workspaces[: max(1, int(limit))]:
-            trimmed.append(
-                {
-                    "cwd": workspace.get("cwd"),
-                    "sessions": workspace.get("sessionCount"),
-                    "named": workspace.get("namedCount"),
-                    "last_used": workspace.get("lastUsedAt"),
-                    "names": [s.get("name") for s in workspace.get("sessions", []) if s.get("name")],
-                }
+        shown = workspaces[: max(1, int(limit))]
+
+        # The model reads `content`; anything else in the dict is structured
+        # data it may never look at. So the listing is rendered as text here
+        # rather than leaving the model to interpret a nested object -- doing
+        # that once made a bot report "no sessions" while holding the data.
+        if not shown:
+            if cwd:
+                content = f"工作目录 {cwd} 下没有找到任何会话。"
+            elif named:
+                content = "没有任何具名会话。"
+            else:
+                content = "没有找到任何工作区或会话。"
+        else:
+            lines = []
+            for workspace in shown:
+                total = workspace.get("sessionCount") or 0
+                named_n = workspace.get("namedCount") or 0
+                last = workspace.get("lastUsedAt")
+                header = f"{workspace.get('cwd')}（{total} 个会话"
+                if named_n:
+                    header += f"，其中 {named_n} 个有名字"
+                header += "）" if last is None else f"，最近使用 {last}）"
+                lines.append(header)
+                names = [
+                    s.get("name")
+                    for s in workspace.get("sessions", [])
+                    if s.get("name")
+                ]
+                if names:
+                    lines.append("    可接着聊的会话名：" + "、".join(names))
+                else:
+                    lines.append("    （该目录下的会话都没有名字，可用其目录默认身份继续）")
+            content = (
+                f"共 {len(workspaces)} 个工作区，"
+                f"{value.get('totalSessions')} 个会话（其中 "
+                f"{value.get('namedSessions')} 个有名字）：\n"
+                + "\n".join(lines)
             )
 
         return {
-            "workspaces": trimmed,
-            "workspace_count": len(trimmed),
+            "content": content,
+            # Structured copy, kept so the model can cross-check if it wants.
+            "workspaces": [
+                {
+                    "cwd": w.get("cwd"),
+                    "session_count": w.get("sessionCount"),
+                    "named_count": w.get("namedCount"),
+                    "names": [s.get("name") for s in w.get("sessions", []) if s.get("name")],
+                }
+                for w in shown
+            ],
+            "workspace_count": len(workspaces),
             "total_sessions": value.get("totalSessions"),
             "named_sessions": value.get("namedSessions"),
-            "message": (
-                "要接着某个会话聊，把它的 name 传给 dsh_dispatch 的 session_name；"
-                "没名字的会话就用它所在目录的默认身份继续。"
-            ),
         }
 
     @Tool(
@@ -716,7 +751,14 @@ class DshHarnessPlugin(MaiBotPlugin):
             "sessions_new",
             {"cwd": cwd or cfg.default_cwd, "name": name or None},
         )
-        return value
+        label = value.get("name") or "默认会话"
+        return {
+            "content": (
+                f"已新建会话 {value.get('sessionId')}（{label}，"
+                f"目录 {value.get('cwd')}）。后续用这个名字派活即可接着聊。"
+            ),
+            **value,
+        }
 
     @Tool(
         "dsh_dispatch",
@@ -785,15 +827,17 @@ class DshHarnessPlugin(MaiBotPlugin):
         )
         # `stop_after_execution` ends this turn once the batch completes: the
         # job is running elsewhere, so waiting here would only stall the chat.
+        where = value.get("sessionName") or "默认会话"
         return {
+            "content": (
+                f"任务已派给本地助手在后台执行（会话：{where}），任务号 {value.get('taskId')}。"
+                "它干完后会自动回来汇报。请用你自己的话简短告诉用户已经安排上了，"
+                "现在还没有结果，不要编造。"
+            ),
             "success": True,
             "status": "dispatched",
             "task_id": value.get("taskId"),
             "session_name": value.get("sessionName"),
-            "message": (
-                "任务已交给本地助手在后台执行，完成后会自动汇报。"
-                "请用你自己的话简短告知用户已经安排上了，不要编造结果。"
-            ),
             "stop_after_execution": True,
         }
 
@@ -821,14 +865,17 @@ class DshHarnessPlugin(MaiBotPlugin):
         status = value.get("status")
         reply = (value.get("reply") or "").strip()
         if status == "running":
-            return {"status": "running", "message": "任务还在执行中，还没有结果。"}
+            return {
+                "content": "该任务还在执行中，目前还没有结果。",
+                "status": "running",
+            }
         return {
+            "content": (
+                "这是该任务的完整结果，请据此回答用户的问题；"
+                "如果用户问的细节这里没有，再考虑回去追问：\n\n" + reply
+            ),
             "status": status,
             "reply": reply,
-            "message": (
-                "这是该任务的完整结果，请据此回答用户的问题；"
-                "如果用户问的细节这里没有，再考虑回去追问。"
-            ),
         }
 
     @Tool(
@@ -859,7 +906,10 @@ class DshHarnessPlugin(MaiBotPlugin):
     async def handle_followup(self, task_id: str, question: str, **kwargs):
         cfg = self._config()
         if not cfg.followup_enabled:
-            return {"success": False, "message": "追问功能已被管理员关闭，请根据已有结果回答。"}
+            return {
+                "content": "追问功能已被管理员关闭，请根据已有结果回答用户。",
+                "success": False,
+            }
 
         original = await self._call("task_status", {"taskId": task_id})
         cwd = original.get("cwd") or cfg.default_cwd
@@ -875,11 +925,12 @@ class DshHarnessPlugin(MaiBotPlugin):
                 "text": self._prepare_prompt(question),
             },
         )
+        answer = self._format_reply(value)
         return {
+            "content": "这是本地助手对追问的回答，请用你的话转达给用户：\n\n" + answer,
             "success": True,
-            "reply": self._format_reply(value),
+            "reply": answer,
             "session_name": session_name,
-            "message": "这是本地助手对追问的回答，请用你的话转达给用户。",
         }
 
     @Tool(
@@ -916,8 +967,10 @@ class DshHarnessPlugin(MaiBotPlugin):
                 "text": self._prepare_prompt(text),
             },
         )
+        answer = self._format_reply(value)
         return {
-            "reply": self._format_reply(value),
+            "content": "本地助手的回答如下，请据此回应用户：\n\n" + answer,
+            "reply": answer,
             "session_id": value.get("sessionId"),
             "stop_reason": value.get("stopReason"),
             "tool_calls": value.get("toolCalls"),
@@ -949,32 +1002,87 @@ class DshHarnessPlugin(MaiBotPlugin):
         ],
     )
     async def handle_search(self, query: str, cwd: str | None = None, **kwargs):
+        """Search recent history for a literal string.
+
+        Deliberately narrow. ACP has no content search, so this walks sessions
+        and greps their history -- each lookup is a process spawn, so the scan
+        is bounded and run with limited concurrency. An unbounded serial walk
+        once fired dozens of spawns in a few seconds and produced spurious
+        agent failures while the machine was busy.
+        """
         cfg = self._config()
         needle = (query or "").strip().lower()
         if not needle:
-            return {"error": "query 不能为空"}
+            return {"content": "检索关键字不能为空。", "error": "empty query"}
 
+        workspace = cwd or cfg.default_cwd
         listing = await self._call(
             "sessions_list",
-            {"cwd": cwd or cfg.default_cwd, "filterCwd": cwd or None, "source": "agent"},
+            {"cwd": workspace, "filterCwd": workspace, "source": "agent"},
         )
-        sessions = listing.get("sessions", [])[: cfg.search_scan_limit]
+        sessions = [
+            s
+            for s in listing.get("sessions", [])
+            if s.get("cwd") == workspace and not s.get("closed")
+        ][: cfg.search_scan_limit]
 
-        hits: list[dict[str, Any]] = []
-        for session in sessions:
-            try:
-                history = await self._call(
-                    "sessions_history",
-                    {"cwd": session.get("cwd") or cwd or cfg.default_cwd, "limit": 20},
-                )
-            except RuntimeError:
-                continue
-            for line in history.get("history", []):
-                if needle in line.lower():
-                    hits.append({"sessionId": session.get("sessionId"), "line": line[:300]})
-                    break
+        if not sessions:
+            return {
+                "content": f"工作目录 {workspace} 下没有可检索的会话。",
+                "query": query,
+                "scanned": 0,
+                "hits": [],
+            }
 
-        return {"query": query, "scanned": len(sessions), "hits": hits}
+        # Bounded concurrency: enough to be quick, few enough that the host is
+        # not asked to spawn a swarm of agent processes.
+        gate = asyncio.Semaphore(3)
+
+        async def scan(session):
+            async with gate:
+                try:
+                    history = await self._call(
+                        "sessions_history",
+                        {
+                            # Name the exact session. Without it the lookup
+                            # falls back to that directory's default session,
+                            # so the scan would inspect something else.
+                            "cwd": session.get("cwd") or workspace,
+                            "name": session.get("name"),
+                            "limit": 20,
+                        },
+                    )
+                except RuntimeError:
+                    return None
+                lines = history.get("history", [])
+                if isinstance(lines, str):
+                    lines = lines.splitlines()
+                for line in lines:
+                    if needle in str(line).lower():
+                        return {
+                            "sessionId": session.get("sessionId"),
+                            "name": session.get("name"),
+                            "cwd": session.get("cwd"),
+                            "line": str(line)[:300],
+                        }
+                return None
+
+        results = await asyncio.gather(*(scan(s) for s in sessions))
+        hits = [r for r in results if r]
+
+        if not hits:
+            content = (
+                f"在 {workspace} 下扫描了 {len(sessions)} 个会话，"
+                f"没有找到包含「{query}」的记录。"
+            )
+        else:
+            lines = [f"在 {workspace} 下扫描 {len(sessions)} 个会话，匹配到 {len(hits)} 条："]
+            for hit in hits[:5]:
+                label = hit["name"] or hit["sessionId"]
+                lines.append(f"  [{label}] {hit['line']}")
+            content = "\n".join(lines)
+
+        return {"content": content, "query": query, "scanned": len(sessions), "hits": hits}
 
     # ------------------------------------------------------------------
     # Commands
