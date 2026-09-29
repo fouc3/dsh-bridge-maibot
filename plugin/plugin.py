@@ -36,8 +36,6 @@ deliberately conservative:
   rejects everything else before touching any state.
 """
 
-from __future__ import annotations
-
 import asyncio
 import json
 import threading
@@ -51,12 +49,29 @@ from maibot_sdk.types import ToolParameterInfo, ToolParamType
 __all__ = ["DshHarnessPlugin", "create_plugin"]
 
 
+class PluginSectionConfig(PluginConfigBase):
+    """基础配置节。
+
+    The runner requires a ``[plugin]`` section carrying ``config_version``;
+    without it the plugin is refused before it ever loads.
+    """
+
+    __ui_label__ = "插件"
+    __ui_icon__ = "package"
+    __ui_order__ = 0
+
+    enabled: bool = Field(default=True, description="是否启用插件")
+    config_version: str = Field(default="1.0.0", description="配置版本号")
+
+
 class DshHarnessConfig(PluginConfigBase):
     """Operator-facing settings; the bridge coordinates live here."""
 
-    enabled: bool = Field(
-        default=True,
-        description="是否启用本插件。关闭后所有工具与命令直接拒绝。",
+    __ui_label__ = "DSH Harness 桥接"
+
+    plugin: PluginSectionConfig = Field(
+        default_factory=PluginSectionConfig,
+        description="插件基础设置",
     )
     bridge_host: str = Field(
         default="172.24.0.1",
@@ -83,7 +98,7 @@ class DshHarnessConfig(PluginConfigBase):
         description="新建会话与默认查找会话时使用的工作目录。",
     )
     allowed_senders: list[str] = Field(
-        default_factory=list,
+        default=[],
         description=(
             "允许触发本插件的发送者 ID 白名单。默认为空 = 任何人都不能触发；"
             "必须显式填写才生效。"
@@ -124,6 +139,7 @@ class DshHarnessConfig(PluginConfigBase):
     )
 
 
+
 class CallbackListener:
     """A tiny authenticated HTTP endpoint the bridge reports outcomes to.
 
@@ -137,10 +153,13 @@ class CallbackListener:
 
     MAX_BODY_BYTES: ClassVar[int] = 256 * 1024
 
-    def __init__(self, *, host: str, port: int, token: str, on_event, logger) -> None:
+    def __init__(self, *, host: str, port: int, token_provider, on_event, logger) -> None:
         self._host = host
         self._port = port
-        self._token = token
+        # A callable rather than a value: the token may be filled in through
+        # the settings page after the listener is already running, and
+        # restarting the bot to pick it up would be unreasonable.
+        self._token_provider = token_provider
         self._on_event = on_event
         self._logger = logger
         self._server: ThreadingHTTPServer | None = None
@@ -228,12 +247,18 @@ class CallbackListener:
         """Constant-time comparison of the bearer credential."""
         import hmac
 
-        if not self._token:
+        # Read the current token on every request so a settings change takes
+        # effect without a restart.
+        try:
+            token = self._token_provider() or ""
+        except Exception:  # noqa: BLE001 - a broken config must not authenticate
+            return False
+        if not token:
             return False
         prefix = "Bearer "
         if not header.startswith(prefix):
             return False
-        return hmac.compare_digest(header[len(prefix) :], self._token)
+        return hmac.compare_digest(header[len(prefix) :], token)
 
     def stop(self) -> None:
         if self._server is not None:
@@ -250,8 +275,16 @@ class DshHarnessPlugin(MaiBotPlugin):
 
     REQUEST_TIMEOUT_GRACE: ClassVar[int] = 30
 
+    # Declaring the model makes the runner generate defaults, backfill new
+    # fields on upgrade, and render the settings page; the instance then
+    # arrives as `self.config`.
+    config_model: ClassVar[type[PluginConfigBase]] = DshHarnessConfig
+
     def __init__(self) -> None:
-        self._cfg: DshHarnessConfig | None = None
+        # The SDK base initializes state its own machinery consults right after
+        # load (for example the dynamic-API component registry). Skipping it
+        # breaks plugin registration entirely, not just this class.
+        super().__init__()
         self._listener: CallbackListener | None = None
         # Captured at load time so the listener thread can hand work back to
         # the loop the bot actually runs on.
@@ -265,12 +298,16 @@ class DshHarnessPlugin(MaiBotPlugin):
         """Start the callback listener as soon as the plugin is loaded."""
         self.ctx.logger.info("dsh-harness 插件已加载")
         self._loop = asyncio.get_running_loop()
+        self._start_listener()
+
+    def _start_listener(self) -> None:
+        """Bind the callback listener using the current configuration."""
         cfg = self._config()
         try:
             self._listener = CallbackListener(
                 host=cfg.callback_listen_host,
                 port=cfg.callback_listen_port,
-                token=cfg.bridge_token,
+                token_provider=lambda: self._config().bridge_token,
                 on_event=self._on_bridge_event,
                 logger=self.ctx.logger,
             )
@@ -289,9 +326,22 @@ class DshHarnessPlugin(MaiBotPlugin):
         self.ctx.logger.info("dsh-harness 插件已卸载")
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
-        if scope == "self":
-            self._cfg = None
-            self.ctx.logger.info("dsh-harness 配置已更新: version=%s", version)
+        if scope != "self":
+            return
+        # The token is read per request, so only a changed bind address needs
+        # the listener restarted.
+        cfg = self._config()
+        bound = self._listener is not None
+        wants = (cfg.callback_listen_host, cfg.callback_listen_port)
+        current = (getattr(self._listener, "_host", None), getattr(self._listener, "_port", None))
+        if bound and wants != current:
+            self.ctx.logger.info("dsh-harness 回调监听地址变更，正在重启监听器")
+            self._listener.stop()
+            self._listener = None
+            self._start_listener()
+        elif not bound:
+            self._start_listener()
+        self.ctx.logger.info("dsh-harness 配置已更新: version=%s", version)
 
     # ------------------------------------------------------------------
     # Callback handling
@@ -384,14 +434,18 @@ class DshHarnessPlugin(MaiBotPlugin):
     # ------------------------------------------------------------------
 
     def _config(self) -> DshHarnessConfig:
-        if self._cfg is None:
-            self._cfg = self.ctx.config.load(DshHarnessConfig)
-        return self._cfg
+        """Return the typed config the SDK injects.
+
+        Declaring ``config_model`` makes the runner generate the defaults, fill
+        in missing fields, and expose the schema to the WebUI; the instance is
+        then reachable as ``self.config``.
+        """
+        return self.config
 
     def _guard(self, sender_id: str | None) -> str | None:
         """Return a refusal message, or None when the call may proceed."""
         cfg = self._config()
-        if not cfg.enabled:
+        if not cfg.plugin.enabled:
             return "插件当前已禁用。"
         if not cfg.bridge_token:
             return "插件未配置 bridge_token，请先在麦麦插件配置中填写。"

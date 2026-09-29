@@ -26,7 +26,15 @@ PLUGIN_DIR = ROOT / "plugin"
 
 
 def install_sdk_stub() -> None:
-    """Provide a minimal stand-in for maibot_sdk so plugin.py can import."""
+    """Provide a minimal but faithful stand-in for maibot_sdk.
+
+    The stub mirrors the two contracts a plugin can easily violate and which
+    the real runtime reacts to at load time:
+
+    * ``MaiBotPlugin.__init__`` seeds SDK-owned state, so a subclass that
+      forgets ``super().__init__()`` fails the same way it does in production;
+    * ``config_model`` is honoured, with the instance exposed as ``self.config``.
+    """
     sdk = types.ModuleType("maibot_sdk")
 
     class _Decorator:
@@ -36,11 +44,37 @@ def install_sdk_stub() -> None:
         def __call__(self, fn):
             return fn
 
-    class MaiBotPlugin:  # noqa: D101 - stub
-        pass
+    class PluginConfigBase:  # noqa: D101 - mirrors the SDK base
+        def __init__(self, **values) -> None:
+            # Defaults declared as class attributes are the schema defaults,
+            # exactly as the real base materializes them.
+            for name in dir(type(self)):
+                if name.startswith("_"):
+                    continue
+                attr = getattr(type(self), name)
+                if callable(attr):
+                    continue
+                setattr(self, name, values.get(name, attr))
 
-    class PluginConfigBase:  # noqa: D101 - stub
-        pass
+    class MaiBotPlugin:  # noqa: D101 - mirrors the SDK base
+        config_model = None
+
+        def __init__(self) -> None:
+            # SDK-owned state; the dynamic-API registry is what the runtime
+            # touches right after load.
+            self._dynamic_api_components: dict = {}
+            self._dynamic_api_handlers: dict = {}
+            self._plugin_config_data: dict = {}
+            self._plugin_config_instance = None
+
+        @property
+        def config(self):  # noqa: D102 - mirrors the SDK property
+            model = type(self).config_model
+            if model is None:
+                raise RuntimeError("当前插件未声明 config_model，无法通过 config 属性访问强类型配置")
+            if self._plugin_config_instance is None:
+                self._plugin_config_instance = model()
+            return self._plugin_config_instance
 
     def Field(default=None, **kwargs):  # noqa: N802 - mirrors the SDK name
         return default
@@ -123,7 +157,7 @@ def main() -> int:
     listener = CallbackListener(
         host="127.0.0.1",
         port=0,
-        token=TOKEN,
+        token_provider=lambda: TOKEN,
         on_event=on_event,
         logger=FakeLogger(),
     )
@@ -171,7 +205,7 @@ def main() -> int:
             raise RuntimeError("bot unavailable")
 
         listener2 = CallbackListener(
-            host="127.0.0.1", port=0, token=TOKEN, on_event=failing, logger=FakeLogger()
+            host="127.0.0.1", port=0, token_provider=lambda: TOKEN, on_event=failing, logger=FakeLogger()
         )
         listener2.start()
         h2, p2 = listener2._server.server_address[:2]
@@ -198,6 +232,71 @@ def main() -> int:
             listener.stop()
         except Exception:
             pass
+
+    # 9b. The token is read per request, so filling it in through the settings
+    #     page takes effect without restarting the bot. Hard-coding it at
+    #     startup would silently reject every callback until a reload.
+    rotating = {"token": ""}
+    received_after = []
+    rotation_listener = CallbackListener(
+        host="127.0.0.1",
+        port=0,
+        token_provider=lambda: rotating["token"],
+        on_event=lambda ev: received_after.append(ev),
+        logger=FakeLogger(),
+    )
+    rotation_listener.start()
+    rh, rp = rotation_listener._server.server_address[:2]
+    rurl = f"http://{rh}:{rp}/event"
+
+    # Nothing is accepted while the token is unset.
+    status, _ = post(rurl, {"taskId": "rot-0", "streamId": "s"}, token=TOKEN)
+    check("an unset token accepts nothing", status == 401)
+
+    rotating["token"] = TOKEN
+    status, body = post(rurl, {"taskId": "rot-1", "streamId": "s"})
+    check("a token set later is honoured without a restart", status == 200 and body.get("ok") is True)
+    check("the late-set token delivered the event", len(received_after) == 1)
+
+    # Rotating again must invalidate the old value.
+    rotating["token"] = "a-completely-different-token"
+    status, _ = post(rurl, {"taskId": "rot-2", "streamId": "s"}, token=TOKEN)
+    check("a rotated token invalidates the old one", status == 401)
+    rotation_listener.stop()
+
+    # 10. The plugin must be constructible and expose its typed config. Both
+    #     of these failed against the real runtime and are cheap to lock down:
+    #     a subclass that skips super().__init__() has no SDK state, and one
+    #     that declares no config_model has no typed config.
+    from plugin import DshHarnessPlugin, DshHarnessConfig
+
+    try:
+        instance = DshHarnessPlugin()
+        check("plugin constructs", True)
+    except Exception as exc:  # noqa: BLE001 - report, do not crash the suite
+        instance = None
+        check("plugin constructs", False, repr(exc))
+
+    if instance is not None:
+        check(
+            "SDK-owned state is initialized",
+            hasattr(instance, "_dynamic_api_components"),
+            "a subclass must call super().__init__(); the runtime reads this right after load",
+        )
+        check(
+            "config_model is declared",
+            getattr(type(instance), "config_model", None) is DshHarnessConfig,
+            "the runner needs it to generate defaults and the settings schema",
+        )
+        try:
+            cfg = instance.config
+            check("typed config is reachable", isinstance(cfg, DshHarnessConfig))
+            # A security-relevant default: nothing may trigger the plugin until
+            # an operator opts senders in.
+            check("allowed_senders defaults to empty", list(cfg.allowed_senders) == [])
+            check("write ops default to off", cfg.enable_write_ops is False)
+        except Exception as exc:  # noqa: BLE001
+            check("typed config is reachable", False, repr(exc))
 
     print()
     if failures:
